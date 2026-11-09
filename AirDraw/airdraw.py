@@ -1,33 +1,3 @@
-"""
-AirDraw - draw on top of ANY Windows app with hand gestures.
-
-Uses the current MediaPipe Tasks API (HandLandmarker). The old `mp.solutions`
-API is gone from recent MediaPipe releases, so this file does not use it.
-
-Install (use a fresh venv, 64-bit Python 3.10-3.12):
-    python -m pip install -U pip
-    pip install -U opencv-python mediapipe PyQt6 keyboard
-
-Run:
-    python airdraw.py              # add --preview for a camera debug window
-
-The hand model (hand_landmarker.task, ~7 MB) is downloaded automatically
-next to this script on first run.
-
-Gestures (one hand, palm facing the camera):
-    Index finger up only ........ draw
-    Index + middle up (peace) ... move pointer without drawing
-    Open palm (hold ~1 s) ....... clear the screen
-    Fist / anything else ........ pen up
-
-Global hotkeys:
-    Ctrl+Alt+D  hand tracking on/off (off = camera released)
-    Ctrl+Alt+C  clear drawing
-    Ctrl+Alt+H  hide/show overlay
-    Ctrl+Alt+K  next color
-    Ctrl+Alt+Q  quit
-(Run from an admin terminal if hotkeys don't fire while an admin app has focus.)
-"""
 import argparse
 import ctypes
 import math
@@ -44,25 +14,68 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 from PyQt6.QtCore import QObject, QPointF, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QGuiApplication, QIcon, QImage, QPainter, QPen, QPixmap
-from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QGuiApplication,
+    QIcon,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+)
+from PyQt6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QMenu,
+    QPushButton,
+    QSlider,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
+
 
 # ----------------------------- tuning knobs -----------------------------
-MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
-             "hand_landmarker/float16/latest/hand_landmarker.task")
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/latest/hand_landmarker.task"
+)
 MODEL_PATH = Path(__file__).resolve().with_name("hand_landmarker.task")
 
-FRAME_W, FRAME_H = 640, 480
-ACTIVE_X = (0.15, 0.85)   # part of the camera frame that maps to the full screen width
-ACTIVE_Y = (0.10, 0.75)   # ...and height (hands rarely reach the bottom of the frame)
-STABLE_FRAMES = 2         # frames a gesture must persist before it counts
-LOST_FRAMES = 6           # frames without a hand before the pointer disappears
-CLEAR_HOLD_S = 1.0        # hold open palm this long to clear
-SMOOTH_MIN_CUTOFF = 1.2   # lower = smoother but laggier
-SMOOTH_BETA = 10.0        # higher = more responsive on fast moves
+FRAME_W, FRAME_H = 360, 240
+ACTIVE_X = (0.15, 0.85)  # camera area mapped to screen width
+ACTIVE_Y = (0.10, 0.75)  # camera area mapped to screen height
+STABLE_FRAMES = 2
+LOST_FRAMES = 6
+CLEAR_HOLD_S = 1.0
 COLORS = ["#ff2d55", "#30d158", "#0a84ff", "#ffd60a", "#ffffff", "#bf5af2"]
 
-# Hand skeleton, used only for the --preview window (the Tasks API doesn't ship a drawer).
+# One Euro filter. Tune one at a time:
+#   wobbles when hand is still -> lower MIN_CUTOFF (try 0.6-0.8)
+#   lags on fast strokes       -> raise BETA (try 15-25)
+SMOOTH_MIN_CUTOFF = 1.2
+SMOOTH_BETA = 10.0
+
+# Gesture classification: cosine of the joint bend angle above which a finger
+# counts as straight. Lower = more forgiving.
+STRAIGHT_COS = 0.5
+
+# Frames of ink held back so the unstable tail before a gesture change can be
+# discarded. ~30 ms per frame at 30 fps; set to 1 if the trailing ink bothers you.
+LAG = 2
+
+# MediaPipe confidence thresholds. Raise tracking to 0.6-0.7 if landmarks jitter
+# or snap to wrong poses; lower to 0.4 if tracking drops too often.
+MIN_DETECTION_CONF = 0.6
+MIN_PRESENCE_CONF = 0.5
+MIN_TRACKING_CONF = 0.5
+
+# OpenCV uses: output = input * contrast + brightness.
+DEFAULT_BRIGHTNESS = 25       # slider range: -50 to +100
+DEFAULT_CONTRAST = 1.30       # slider range: 0.50x to 2.50x
+
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -75,15 +88,16 @@ HAND_CONNECTIONS = [
 user32 = ctypes.windll.user32 if sys.platform == "win32" else None
 
 
-# ----------------------------- helpers -----------------------------
-def clamp01(v):
-    return max(0.0, min(1.0, v))
+# -------------------------------- helpers --------------------------------
+def clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
 
 
-def ensure_model():
+def ensure_model() -> None:
     """Download the HandLandmarker model once, next to this script."""
     if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 1_000_000:
         return
+
     print(f"Downloading hand model to {MODEL_PATH} ...")
     tmp = MODEL_PATH.with_suffix(".tmp")
     try:
@@ -91,56 +105,80 @@ def ensure_model():
         tmp.replace(MODEL_PATH)
     except Exception as exc:
         tmp.unlink(missing_ok=True)
-        sys.exit(f"Could not download the model: {exc}\n"
-                 f"Download it manually from:\n  {MODEL_URL}\n"
-                 f"and save it as:\n  {MODEL_PATH}")
+        sys.exit(
+            f"Could not download the model: {exc}\n"
+            f"Download it manually from:\n  {MODEL_URL}\n"
+            f"and save it as:\n  {MODEL_PATH}"
+        )
 
 
 class OneEuro:
-    """One Euro filter: removes jitter when slow, stays responsive when fast."""
+    """One Euro filter: reduces jitter while remaining responsive to fast motion."""
 
-    def __init__(self, min_cutoff=SMOOTH_MIN_CUTOFF, beta=SMOOTH_BETA, d_cutoff=1.0):
-        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+    def __init__(
+        self,
+        min_cutoff: float = SMOOTH_MIN_CUTOFF,
+        beta: float = SMOOTH_BETA,
+        d_cutoff: float = 1.0,
+    ) -> None:
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
         self.reset()
 
-    def reset(self):
-        self.x_prev = self.dx_prev = self.t_prev = None
+    def reset(self) -> None:
+        self.x_prev = None
+        self.dx_prev = None
+        self.t_prev = None
 
     @staticmethod
-    def _alpha(cutoff, dt):
-        tau = 1.0 / (2 * math.pi * cutoff)
+    def _alpha(cutoff: float, dt: float) -> float:
+        tau = 1.0 / (2.0 * math.pi * cutoff)
         return 1.0 / (1.0 + tau / dt)
 
-    def __call__(self, x, t):
+    def __call__(self, x: float, timestamp: float) -> float:
         if self.t_prev is None:
-            self.x_prev, self.dx_prev, self.t_prev = x, 0.0, t
+            self.x_prev, self.dx_prev, self.t_prev = x, 0.0, timestamp
             return x
-        dt = max(t - self.t_prev, 1e-3)
+
+        dt = max(timestamp - self.t_prev, 1e-3)
         dx = (x - self.x_prev) / dt
-        a_d = self._alpha(self.d_cutoff, dt)
-        dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
+        alpha_d = self._alpha(self.d_cutoff, dt)
+        dx_hat = alpha_d * dx + (1.0 - alpha_d) * self.dx_prev
         cutoff = self.min_cutoff + self.beta * abs(dx_hat)
-        a = self._alpha(cutoff, dt)
-        x_hat = a * x + (1 - a) * self.x_prev
-        self.x_prev, self.dx_prev, self.t_prev = x_hat, dx_hat, t
+        alpha = self._alpha(cutoff, dt)
+        x_hat = alpha * x + (1.0 - alpha) * self.x_prev
+
+        self.x_prev, self.dx_prev, self.t_prev = x_hat, dx_hat, timestamp
         return x_hat
 
 
-def classify(lm, w, h):
-    """Return 'draw', 'hover', 'clear' or 'idle' from 21 hand landmarks."""
+def classify(landmarks, width: int, height: int) -> str:
+    """Return 'draw', 'hover', 'clear' or 'idle' from 21 hand landmarks.
 
-    def pt(i):
-        return lm[i].x * w, lm[i].y * h
+    Uses the 3D bend angle at each finger's PIP joint instead of wrist
+    distance, so tilting the hand toward the camera doesn't misfire.
+    """
 
-    def dist(a, b):
-        return math.hypot(a[0] - b[0], a[1] - b[1])
+    def vec(a: int, b: int):  # 3D vector a->b, z scaled like x
+        return (
+            (landmarks[b].x - landmarks[a].x) * width,
+            (landmarks[b].y - landmarks[a].y) * height,
+            (landmarks[b].z - landmarks[a].z) * width,
+        )
 
-    wrist = pt(0)
+    def straight(mcp: int, pip: int, tip: int) -> bool:
+        a, b = vec(mcp, pip), vec(pip, tip)
+        dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+        na = math.sqrt(a[0] ** 2 + a[1] ** 2 + a[2] ** 2)
+        nb = math.sqrt(b[0] ** 2 + b[1] ** 2 + b[2] ** 2)
+        return dot / (na * nb + 1e-6) > STRAIGHT_COS
 
-    def extended(tip, pip):  # rotation-independent: tip farther from wrist than PIP joint
-        return dist(wrist, pt(tip)) > dist(wrist, pt(pip)) * 1.1
+    index = straight(5, 6, 8)
+    middle = straight(9, 10, 12)
+    ring = straight(13, 14, 16)
+    pinky = straight(17, 18, 20)
 
-    index, middle, ring, pinky = extended(8, 6), extended(12, 10), extended(16, 14), extended(20, 18)
     if index and not middle and not ring and not pinky:
         return "draw"
     if index and middle and not ring and not pinky:
@@ -150,23 +188,28 @@ def classify(lm, w, h):
     return "idle"
 
 
-def draw_hand(frame, lm):
-    h, w = frame.shape[:2]
-    pts = [(int(p.x * w), int(p.y * h)) for p in lm]
-    for a, b in HAND_CONNECTIONS:
-        cv2.line(frame, pts[a], pts[b], (0, 200, 0), 2)
-    for p in pts:
-        cv2.circle(frame, p, 3, (0, 0, 255), -1)
+def draw_hand(frame, landmarks) -> None:
+    height, width = frame.shape[:2]
+    points = [
+        (int(point.x * width), int(point.y * height))
+        for point in landmarks
+    ]
+    for start, end in HAND_CONNECTIONS:
+        cv2.line(frame, points[start], points[end], (0, 220, 90), 2)
+    for point in points:
+        cv2.circle(frame, point, 3, (30, 30, 255), -1)
 
 
-# ----------------------------- camera / gesture thread -----------------------------
+# ----------------------------- camera worker -----------------------------
 class HandWorker(QThread):
-    moved = pyqtSignal(float, float, str)   # normalized screen x, y, stable gesture
+    moved = pyqtSignal(float, float, str)
     lost = pyqtSignal()
     clear_requested = pyqtSignal()
     camera_error = pyqtSignal(str)
+    camera_frame = pyqtSignal(QImage)
+    camera_status = pyqtSignal(str)
 
-    def __init__(self, cam_index, preview):
+    def __init__(self, cam_index: int, preview: bool) -> None:
         super().__init__()
         self.cam_index = cam_index
         self.preview = preview
@@ -174,151 +217,330 @@ class HandWorker(QThread):
         self.enabled.set()
         self.running = True
 
+        self._adjustment_lock = threading.Lock()
+        self._brightness = DEFAULT_BRIGHTNESS
+        self._contrast = DEFAULT_CONTRAST
+
+    def set_image_adjustments(self, brightness: int, contrast_percent: int) -> None:
+        """Thread-safe update from the camera window's sliders."""
+        with self._adjustment_lock:
+            self._brightness = int(brightness)
+            self._contrast = max(0.5, min(2.5, contrast_percent / 100.0))
+
+    def _get_image_adjustments(self):
+        with self._adjustment_lock:
+            return self._brightness, self._contrast
+
     def _open_camera(self):
-        cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
+        if sys.platform == "win32":
+            cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(self.cam_index)
+
+        # MJPG avoids the slow YUY2 default that silently caps many webcams at
+        # 15 fps under DSHOW. FOURCC must be set before the frame size.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
         cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # always read the newest frame
+
         if not cap.isOpened():
             cap.release()
             return None
         return cap
 
-    def _make_landmarker(self):
+    @staticmethod
+    def _make_landmarker():
         options = vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(MODEL_PATH)),
             running_mode=vision.RunningMode.VIDEO,
             num_hands=1,
-            min_hand_detection_confidence=0.6,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_hand_detection_confidence=MIN_DETECTION_CONF,
+            min_hand_presence_confidence=MIN_PRESENCE_CONF,
+            min_tracking_confidence=MIN_TRACKING_CONF,
         )
         return vision.HandLandmarker.create_from_options(options)
 
-    def run(self):
+    def run(self) -> None:
         try:
             landmarker = self._make_landmarker()
         except Exception as exc:
             self.camera_error.emit(f"Failed to load hand model: {exc}")
+            self.camera_status.emit("Hand model failed to load")
             return
 
-        fx, fy = OneEuro(), OneEuro()
+        filter_x, filter_y = OneEuro(), OneEuro()
         cap = None
-        cand, cand_n, stable = "idle", 0, "idle"
-        missing = LOST_FRAMES
+        candidate, candidate_count, stable_gesture = "idle", 0, "idle"
+        missing_frames = LOST_FRAMES
         clear_since, clear_fired = None, False
-        last_ts = -1  # VIDEO mode requires strictly increasing timestamps (ms)
+        last_timestamp_ms = -1
 
-        while self.running:
-            if not self.enabled.is_set():
-                if cap is not None:
-                    cap.release()
-                    cap = None
-                    self.lost.emit()
-                    if self.preview:
-                        cv2.destroyAllWindows()
-                time.sleep(0.1)
-                continue
-
-            if cap is None:
-                cap = self._open_camera()
-                if cap is None:
-                    self.camera_error.emit(f"Could not open camera {self.cam_index}")
-                    self.enabled.clear()
+        try:
+            while self.running:
+                if not self.enabled.is_set():
+                    if cap is not None:
+                        cap.release()
+                        cap = None
+                        self.lost.emit()
+                        self.camera_status.emit("Tracking paused — camera released")
+                        if self.preview:
+                            cv2.destroyWindow("AirDraw debug preview")
+                    time.sleep(0.1)
                     continue
 
-            ok, frame = cap.read()
-            if not ok:
-                time.sleep(0.01)
-                continue
+                if cap is None:
+                    cap = self._open_camera()
+                    if cap is None:
+                        message = f"Could not open camera {self.cam_index}"
+                        self.camera_error.emit(message)
+                        self.camera_status.emit(message)
+                        self.enabled.clear()
+                        continue
+                    self.camera_status.emit("Camera live — show one hand")
 
-            frame = cv2.flip(frame, 1)  # mirror so movement feels natural
-            h, w = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                ok, frame = cap.read()
+                if not ok:
+                    time.sleep(0.01)
+                    continue
 
-            ts = int(time.monotonic() * 1000)
-            if ts <= last_ts:
-                ts = last_ts + 1
-            last_ts = ts
-            res = landmarker.detect_for_video(mp_image, ts)
-            now = time.time()
+                # Mirror first so the preview behaves like a mirror.
+                frame = cv2.flip(frame, 1)
 
-            if res.hand_landmarks:
-                lm = res.hand_landmarks[0]
-                missing = 0
+                # Apply the live brightness/contrast settings before inference,
+                # so what the user sees is the same image the detector receives.
+                brightness, contrast = self._get_image_adjustments()
+                frame = cv2.convertScaleAbs(frame, alpha=contrast, beta=brightness)
 
-                g = classify(lm, w, h)
-                if g == cand:
-                    cand_n += 1
+                height, width = frame.shape[:2]
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+                timestamp_ms = int(time.monotonic() * 1000)
+                if timestamp_ms <= last_timestamp_ms:
+                    timestamp_ms = last_timestamp_ms + 1
+                last_timestamp_ms = timestamp_ms
+
+                result = landmarker.detect_for_video(mp_image, timestamp_ms)
+                now = time.time()
+                gesture_text = "Show one hand"
+
+                if result.hand_landmarks:
+                    landmarks = result.hand_landmarks[0]
+                    missing_frames = 0
+
+                    gesture = classify(landmarks, width, height)
+                    if gesture == candidate:
+                        candidate_count += 1
+                    else:
+                        candidate, candidate_count = gesture, 1
+                    if candidate_count >= STABLE_FRAMES:
+                        stable_gesture = candidate
+
+                    fingertip = landmarks[8]
+                    normalized_x = clamp01(
+                        (fingertip.x - ACTIVE_X[0]) / (ACTIVE_X[1] - ACTIVE_X[0])
+                    )
+                    normalized_y = clamp01(
+                        (fingertip.y - ACTIVE_Y[0]) / (ACTIVE_Y[1] - ACTIVE_Y[0])
+                    )
+                    screen_x = filter_x(normalized_x, now)
+                    screen_y = filter_y(normalized_y, now)
+
+                    if stable_gesture == "clear":
+                        if clear_since is None:
+                            clear_since = now
+                        elif not clear_fired and now - clear_since >= CLEAR_HOLD_S:
+                            clear_fired = True
+                            self.clear_requested.emit()
+                    else:
+                        clear_since, clear_fired = None, False
+
+                    self.moved.emit(screen_x, screen_y, stable_gesture)
+                    draw_hand(frame, landmarks)
+                    gesture_text = f"Gesture: {stable_gesture.upper()}"
                 else:
-                    cand, cand_n = g, 1
-                if cand_n >= STABLE_FRAMES:
-                    stable = cand
+                    missing_frames += 1
+                    if missing_frames == LOST_FRAMES:
+                        filter_x.reset()
+                        filter_y.reset()
+                        candidate, candidate_count, stable_gesture = "idle", 0, "idle"
+                        clear_since, clear_fired = None, False
+                        self.lost.emit()
 
-                tip = lm[8]
-                nx = clamp01((tip.x - ACTIVE_X[0]) / (ACTIVE_X[1] - ACTIVE_X[0]))
-                ny = clamp01((tip.y - ACTIVE_Y[0]) / (ACTIVE_Y[1] - ACTIVE_Y[0]))
-                sx, sy = fx(nx, now), fy(ny, now)
+                cv2.putText(
+                    frame,
+                    gesture_text,
+                    (12, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (80, 255, 120),
+                    2,
+                    cv2.LINE_AA,
+                )
 
-                if stable == "clear":
-                    if clear_since is None:
-                        clear_since = now
-                    elif not clear_fired and now - clear_since >= CLEAR_HOLD_S:
-                        clear_fired = True
-                        self.clear_requested.emit()
-                else:
-                    clear_since, clear_fired = None, False
-
-                self.moved.emit(sx, sy, stable)
+                # Copy detaches the QImage from the OpenCV frame's memory.
+                camera_image = QImage(
+                    frame.data,
+                    width,
+                    height,
+                    int(frame.strides[0]),
+                    QImage.Format.Format_BGR888,
+                ).copy()
+                self.camera_frame.emit(camera_image)
 
                 if self.preview:
-                    draw_hand(frame, lm)
-                    cv2.putText(frame, stable, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            else:
-                missing += 1
-                if missing == LOST_FRAMES:
-                    fx.reset()
-                    fy.reset()
-                    cand, cand_n, stable = "idle", 0, "idle"
-                    clear_since, clear_fired = None, False
-                    self.lost.emit()
-
+                    cv2.imshow("AirDraw debug preview", frame)
+                    cv2.waitKey(1)
+        finally:
+            if cap is not None:
+                cap.release()
+            landmarker.close()
             if self.preview:
-                cv2.imshow("AirDraw preview", frame)
-                cv2.waitKey(1)
-
-        if cap is not None:
-            cap.release()
-        landmarker.close()
-        if self.preview:
-            cv2.destroyAllWindows()
+                cv2.destroyAllWindows()
+            self.camera_status.emit("Camera stopped")
 
 
-# ----------------------------- overlay window -----------------------------
+# ------------------------------ camera view ------------------------------
+class CameraView(QWidget):
+    """Separate live camera panel with brightness and contrast controls."""
+
+    def __init__(self, worker: HandWorker) -> None:
+        super().__init__()
+        self.worker = worker
+        self.setWindowTitle("AirDraw — Camera View")
+        self.setMinimumWidth(680)
+        self.setStyleSheet(
+            "QWidget { background: #17191f; color: #f2f3f5; }"
+            "QLabel#video { background: #08090c; border: 1px solid #343944; }"
+            "QSlider::groove:horizontal { height: 6px; background: #3a3f4b; border-radius: 3px; }"
+            "QSlider::handle:horizontal { background: #55aaff; width: 14px; margin: -5px 0; border-radius: 7px; }"
+            "QPushButton { background: #303644; border: 1px solid #454d5c;"
+            " padding: 7px 12px; border-radius: 5px; }"
+            "QPushButton:hover { background: #3b4555; }"
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        heading = QLabel("CAMERA FEED")
+        heading.setStyleSheet("font-size: 15px; font-weight: 700; letter-spacing: 1px;")
+        root.addWidget(heading)
+
+        self.video_label = QLabel("Waiting for camera…")
+        self.video_label.setObjectName("video")
+        self.video_label.setFixedSize(FRAME_W, FRAME_H)
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.addWidget(self.video_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        self.status_label = QLabel("Starting camera…")
+        self.status_label.setStyleSheet("color: #aeb8c8; font-size: 12px;")
+        root.addWidget(self.status_label)
+
+        root.addSpacing(4)
+        controls_title = QLabel("IMAGE ADJUSTMENTS")
+        controls_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #cbd5e1;")
+        root.addWidget(controls_title)
+
+        brightness_row = QHBoxLayout()
+        brightness_title = QLabel("Brightness")
+        brightness_title.setFixedWidth(90)
+        self.brightness_value = QLabel(f"{DEFAULT_BRIGHTNESS:+d}")
+        self.brightness_value.setFixedWidth(42)
+        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.brightness_slider.setRange(-50, 100)
+        self.brightness_slider.setValue(DEFAULT_BRIGHTNESS)
+        brightness_row.addWidget(brightness_title)
+        brightness_row.addWidget(self.brightness_slider, 1)
+        brightness_row.addWidget(self.brightness_value)
+        root.addLayout(brightness_row)
+
+        contrast_row = QHBoxLayout()
+        contrast_title = QLabel("Contrast")
+        contrast_title.setFixedWidth(90)
+        self.contrast_value = QLabel(f"{DEFAULT_CONTRAST:.2f}x")
+        self.contrast_value.setFixedWidth(42)
+        self.contrast_slider = QSlider(Qt.Orientation.Horizontal)
+        self.contrast_slider.setRange(50, 250)
+        self.contrast_slider.setValue(round(DEFAULT_CONTRAST * 100))
+        contrast_row.addWidget(contrast_title)
+        contrast_row.addWidget(self.contrast_slider, 1)
+        contrast_row.addWidget(self.contrast_value)
+        root.addLayout(contrast_row)
+
+        footer = QHBoxLayout()
+        self.reset_button = QPushButton("Reset image")
+        self.reset_button.clicked.connect(self.reset_adjustments)
+        footer.addWidget(self.reset_button)
+        footer.addStretch(1)
+        hint = QLabel("Adjustments affect both the preview and hand tracking")
+        hint.setStyleSheet("color: #8993a3; font-size: 11px;")
+        footer.addWidget(hint)
+        root.addLayout(footer)
+
+        self.brightness_slider.valueChanged.connect(self._brightness_changed)
+        self.contrast_slider.valueChanged.connect(self._contrast_changed)
+        self._apply_adjustments()
+
+    def _brightness_changed(self, value: int) -> None:
+        self.brightness_value.setText(f"{value:+d}")
+        self._apply_adjustments()
+
+    def _contrast_changed(self, value: int) -> None:
+        self.contrast_value.setText(f"{value / 100.0:.2f}x")
+        self._apply_adjustments()
+
+    def _apply_adjustments(self) -> None:
+        self.worker.set_image_adjustments(
+            self.brightness_slider.value(),
+            self.contrast_slider.value(),
+        )
+
+    def reset_adjustments(self) -> None:
+        self.brightness_slider.setValue(DEFAULT_BRIGHTNESS)
+        self.contrast_slider.setValue(round(DEFAULT_CONTRAST * 100))
+
+    def update_frame(self, image: QImage) -> None:
+        pixmap = QPixmap.fromImage(image)
+        self.video_label.setPixmap(
+            pixmap.scaled(
+                self.video_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def set_status(self, message: str) -> None:
+        self.status_label.setText(message)
+
+
+# ----------------------------- drawing overlay ----------------------------
 class Overlay(QWidget):
-    def __init__(self, color, pen_width):
+    def __init__(self, color: str, pen_width: int) -> None:
         super().__init__()
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
-            | Qt.WindowType.WindowTransparentForInput   # click-through
+            | Qt.WindowType.WindowTransparentForInput
             | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
         screen = QGuiApplication.primaryScreen()
-        # 1px shorter than the screen so Windows doesn't treat the overlay as a
-        # fullscreen app (which can hide the taskbar / confuse other apps).
-        geo = screen.geometry().adjusted(0, 0, 0, -1)
-        self.setGeometry(geo)
+        geometry = screen.geometry().adjusted(0, 0, 0, -1)
+        self.setGeometry(geometry)
 
-        dpr = screen.devicePixelRatio()
-        self.canvas = QImage(int(geo.width() * dpr), int(geo.height() * dpr),
-                             QImage.Format.Format_ARGB32_Premultiplied)
-        self.canvas.setDevicePixelRatio(dpr)
+        device_pixel_ratio = screen.devicePixelRatio()
+        self.canvas = QImage(
+            int(geometry.width() * device_pixel_ratio),
+            int(geometry.height() * device_pixel_ratio),
+            QImage.Format.Format_ARGB32_Premultiplied,
+        )
+        self.canvas.setDevicePixelRatio(device_pixel_ratio)
         self.canvas.fill(Qt.GlobalColor.transparent)
 
         self.color = QColor(color)
@@ -326,79 +548,103 @@ class Overlay(QWidget):
         self.cursor_pos = None
         self.gesture = "idle"
         self.last = None
+        self.pending = []  # points not yet inked (held back by LAG frames)
 
-        # Keep the overlay above everything, including borderless fullscreen apps.
         self._topmost_timer = QTimer(self)
         self._topmost_timer.timeout.connect(self.force_topmost)
         self._topmost_timer.start(1000)
 
-    def force_topmost(self):
+    def force_topmost(self) -> None:
         if user32 is None or not self.isVisible():
             return
         try:
-            user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
-                                            ctypes.c_int, ctypes.c_int, wintypes.UINT]
-            # HWND_TOPMOST=-1 ; NOSIZE|NOMOVE|NOACTIVATE|SHOWWINDOW
-            user32.SetWindowPos(int(self.winId()), wintypes.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0040)
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                wintypes.UINT,
+            ]
+            # HWND_TOPMOST=-1; NOSIZE|NOMOVE|NOACTIVATE|SHOWWINDOW.
+            user32.SetWindowPos(
+                int(self.winId()), wintypes.HWND(-1), 0, 0, 0, 0,
+                0x0001 | 0x0002 | 0x0010 | 0x0040,
+            )
         except Exception:
             pass
 
-    # ---- slots ----
-    def on_hand(self, nx, ny, gesture):
-        p = QPointF(nx * self.width(), ny * self.height())
-        self.cursor_pos, self.gesture = p, gesture
+    def on_hand(self, nx: float, ny: float, gesture: str) -> None:
+        point = QPointF(nx * self.width(), ny * self.height())
+        self.cursor_pos, self.gesture = point, gesture
         if gesture == "draw":
-            self._stroke(self.last or p, p)
-            self.last = p
+            self.pending.append(point)
+            if len(self.pending) > LAG:
+                q = self.pending.pop(0)
+                self._stroke(self.last if self.last is not None else q, q)
+                self.last = q
         else:
+            # Throw away the unstable tail recorded while the fingers were
+            # curling/extending, so strokes don't end in a hook.
+            self.pending.clear()
             self.last = None
         self.update()
 
-    def on_lost(self):
+    def on_lost(self) -> None:
         self.cursor_pos, self.last = None, None
+        self.pending.clear()
         self.update()
 
-    def clear(self):
+    def clear(self) -> None:
         self.canvas.fill(Qt.GlobalColor.transparent)
         self.last = None
+        self.pending.clear()
         self.update()
 
-    def set_color(self, color):
+    def set_color(self, color: str) -> None:
         self.color = QColor(color)
 
-    # ---- drawing ----
-    def _stroke(self, a, b):
+    def _stroke(self, start: QPointF, end: QPointF) -> None:
         painter = QPainter(self.canvas)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(self.color, self.pen_width, Qt.PenStyle.SolidLine,
-                            Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-        painter.drawLine(a, b)
+        painter.setPen(
+            QPen(
+                self.color,
+                self.pen_width,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+                Qt.PenJoinStyle.RoundJoin,
+            )
+        )
+        painter.drawLine(start, end)
         painter.end()
 
-    def paintEvent(self, _event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.drawImage(0, 0, self.canvas)
-        c = self.cursor_pos
-        if c is not None:
-            r = self.pen_width / 2 + 3
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.drawImage(0, 0, self.canvas)
+
+        cursor = self.cursor_pos
+        if cursor is not None:
+            radius = self.pen_width / 2 + 3
             if self.gesture == "draw":
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(self.color)
-                p.drawEllipse(c, r, r)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(self.color)
+                painter.drawEllipse(cursor, radius, radius)
             else:
-                p.setBrush(Qt.BrushStyle.NoBrush)
-                ring = QColor(255, 80, 80) if self.gesture == "clear" else QColor(255, 255, 255)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                ring = (
+                    QColor(255, 80, 80)
+                    if self.gesture == "clear"
+                    else QColor(255, 255, 255)
+                )
                 if self.gesture == "idle":
                     ring.setAlpha(120)
-                p.setPen(QPen(QColor(0, 0, 0, 160), 5))
-                p.drawEllipse(c, 14, 14)
-                p.setPen(QPen(ring, 3))
-                p.drawEllipse(c, 14, 14)
-        p.end()
+                painter.setPen(QPen(QColor(0, 0, 0, 160), 5))
+                painter.drawEllipse(cursor, 14, 14)
+                painter.setPen(QPen(ring, 3))
+                painter.drawEllipse(cursor, 14, 14)
+        painter.end()
 
 
-# ----------------------------- global hotkeys bridge -----------------------------
+# ----------------------------- hotkey bridge ------------------------------
 class HotkeyBridge(QObject):
     toggle = pyqtSignal()
     clear = pyqtSignal()
@@ -407,77 +653,113 @@ class HotkeyBridge(QObject):
     quit = pyqtSignal()
 
 
-def make_icon(color):
-    pm = QPixmap(32, 32)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setBrush(QColor(color))
-    p.setPen(QPen(QColor(30, 30, 30), 2))
-    p.drawEllipse(4, 4, 24, 24)
-    p.end()
-    return QIcon(pm)
+def make_icon(color: str) -> QIcon:
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setBrush(QColor(color))
+    painter.setPen(QPen(QColor(30, 30, 30), 2))
+    painter.drawEllipse(4, 4, 24, 24)
+    painter.end()
+    return QIcon(pixmap)
 
 
-# ----------------------------- main -----------------------------
-def main():
-    ap = argparse.ArgumentParser(description="Draw over any Windows app with hand gestures")
-    ap.add_argument("--camera", type=int, default=0, help="camera index (default 0)")
-    ap.add_argument("--preview", action="store_true", help="show camera debug window")
-    ap.add_argument("--width", type=int, default=6, help="pen width in px")
-    args = ap.parse_args()
+# ---------------------------------- main -----------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Draw over any Windows app with hand gestures"
+    )
+    parser.add_argument(
+        "--camera", type=int, default=0, help="camera index (default: 0)"
+    )
+    parser.add_argument(
+        "--preview", action="store_true",
+        help="also show the optional OpenCV debug preview",
+    )
+    parser.add_argument(
+        "--width", type=int, default=6, help="drawing pen width in pixels"
+    )
+    args = parser.parse_args()
 
     ensure_model()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    color_idx = [0]
+    color_index = [0]
     overlay = Overlay(COLORS[0], args.width)
     overlay.show()
     overlay.force_topmost()
 
     worker = HandWorker(args.camera, args.preview)
+    camera_view = CameraView(worker)
     worker.moved.connect(overlay.on_hand)
     worker.lost.connect(overlay.on_lost)
     worker.clear_requested.connect(overlay.clear)
+    worker.camera_frame.connect(camera_view.update_frame)
+    worker.camera_status.connect(camera_view.set_status)
+
+    # The camera window opens automatically on startup.
+    camera_view.show()
 
     tray = QSystemTrayIcon(make_icon(COLORS[0]), app)
     menu = QMenu()
 
-    def toggle_tracking():
+    def toggle_tracking() -> None:
         if worker.enabled.is_set():
             worker.enabled.clear()
             tray.showMessage("AirDraw", "Hand tracking OFF (camera released)")
+            camera_view.set_status("Tracking paused — camera released")
         else:
             worker.enabled.set()
             tray.showMessage("AirDraw", "Hand tracking ON")
+            camera_view.set_status("Reconnecting to camera…")
 
-    def toggle_overlay():
+    def toggle_overlay() -> None:
         overlay.setVisible(not overlay.isVisible())
         if overlay.isVisible():
             overlay.force_topmost()
 
-    def cycle_color():
-        color_idx[0] = (color_idx[0] + 1) % len(COLORS)
-        overlay.set_color(COLORS[color_idx[0]])
-        tray.setIcon(make_icon(COLORS[color_idx[0]]))
+    def show_camera_view() -> None:
+        camera_view.show()
+        camera_view.raise_()
+        camera_view.activateWindow()
 
-    def quit_app():
+    def toggle_camera_view() -> None:
+        if camera_view.isVisible():
+            camera_view.hide()
+        else:
+            show_camera_view()
+
+    def cycle_color() -> None:
+        color_index[0] = (color_index[0] + 1) % len(COLORS)
+        overlay.set_color(COLORS[color_index[0]])
+        tray.setIcon(make_icon(COLORS[color_index[0]]))
+
+    def quit_app() -> None:
         worker.running = False
-        worker.wait(3000)
+        worker.enabled.set()
+        worker.wait(5000)
         keyboard.unhook_all()
         tray.hide()
+        camera_view.close()
+        overlay.close()
         app.quit()
 
-    for label, fn in [("Toggle tracking  (Ctrl+Alt+D)", toggle_tracking),
-                      ("Clear  (Ctrl+Alt+C)", overlay.clear),
-                      ("Hide/show overlay  (Ctrl+Alt+H)", toggle_overlay),
-                      ("Next color  (Ctrl+Alt+K)", cycle_color),
-                      ("Quit  (Ctrl+Alt+Q)", quit_app)]:
-        act = QAction(label, menu)
-        act.triggered.connect(fn)
-        menu.addAction(act)
+    actions = [
+        ("Toggle tracking  (Ctrl+Alt+D)", toggle_tracking),
+        ("Clear drawing  (Ctrl+Alt+C)", overlay.clear),
+        ("Hide/show overlay  (Ctrl+Alt+H)", toggle_overlay),
+        ("Show/hide camera view", toggle_camera_view),
+        ("Next drawing color  (Ctrl+Alt+K)", cycle_color),
+        ("Quit  (Ctrl+Alt+Q)", quit_app),
+    ]
+    for label, callback in actions:
+        action = QAction(label, menu)
+        action.triggered.connect(callback)
+        menu.addAction(action)
+
     tray.setContextMenu(menu)
     tray.setToolTip("AirDraw")
     tray.show()
@@ -488,15 +770,19 @@ def main():
     bridge.hide_show.connect(toggle_overlay)
     bridge.next_color.connect(cycle_color)
     bridge.quit.connect(quit_app)
+
     keyboard.add_hotkey("ctrl+alt+d", bridge.toggle.emit)
     keyboard.add_hotkey("ctrl+alt+c", bridge.clear.emit)
     keyboard.add_hotkey("ctrl+alt+h", bridge.hide_show.emit)
     keyboard.add_hotkey("ctrl+alt+k", bridge.next_color.emit)
     keyboard.add_hotkey("ctrl+alt+q", bridge.quit.emit)
 
-    worker.camera_error.connect(lambda msg: tray.showMessage("AirDraw", msg))
+    worker.camera_error.connect(lambda message: tray.showMessage("AirDraw", message))
     worker.start()
-    tray.showMessage("AirDraw", "Running. Ctrl+Alt+D toggles tracking, Ctrl+Alt+Q quits.")
+    tray.showMessage(
+        "AirDraw",
+        "Running. Camera view is open. Ctrl+Alt+D toggles tracking; Ctrl+Alt+Q quits.",
+    )
 
     sys.exit(app.exec())
 
